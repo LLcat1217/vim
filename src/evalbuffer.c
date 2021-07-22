@@ -68,7 +68,7 @@ buflist_find_by_name(char_u *name, int curtab_only)
     save_magic = p_magic;
     p_magic = TRUE;
     save_cpo = p_cpo;
-    p_cpo = (char_u *)"";
+    p_cpo = empty_option;
 
     buf = buflist_findnr(buflist_findpat(name, name + STRLEN(name),
 						    TRUE, FALSE, curtab_only));
@@ -88,6 +88,8 @@ find_buffer(typval_T *avar)
 
     if (avar->v_type == VAR_NUMBER)
 	buf = buflist_findnr((int)avar->vval.v_number);
+    else if (in_vim9script() && check_for_string_arg(avar, 0) == FAIL)
+	return NULL;
     else if (avar->v_type == VAR_STRING && avar->vval.v_string != NULL)
     {
 	buf = buflist_findname_exp(avar->vval.v_string);
@@ -128,7 +130,8 @@ find_win_for_curbuf(void)
 }
 
 /*
- * Set line or list of lines in buffer "buf".
+ * Set line or list of lines in buffer "buf" to "lines".
+ * Any type is allowed and converted to a string.
  */
     static void
 set_buffer_lines(
@@ -187,7 +190,7 @@ set_buffer_lines(
 	li = l->lv_first;
     }
     else
-	line = tv_get_string_chk(lines);
+	line = typval_tostring(lines, FALSE);
 
     // default result is zero == OK
     for (;;)
@@ -197,7 +200,8 @@ set_buffer_lines(
 	    // list argument, get next string
 	    if (li == NULL)
 		break;
-	    line = tv_get_string_chk(&li->li_tv);
+	    vim_free(line);
+	    line = typval_tostring(&li->li_tv, FALSE);
 	    li = li->li_next;
 	}
 
@@ -238,6 +242,7 @@ set_buffer_lines(
 	    break;
 	++lnum;
     }
+    vim_free(line);
 
     if (added > 0)
     {
@@ -382,6 +387,12 @@ f_bufnr(typval_T *argvars, typval_T *rettv)
     int		error = FALSE;
     char_u	*name;
 
+    if (in_vim9script()
+	    && (check_for_opt_buffer_arg(argvars, 0) == FAIL
+		|| (argvars[0].v_type != VAR_UNKNOWN
+		    && check_for_opt_bool_arg(argvars, 1) == FAIL)))
+	return;
+
     if (argvars[0].v_type == VAR_UNKNOWN)
 	buf = curbuf;
     else
@@ -454,6 +465,12 @@ f_deletebufline(typval_T *argvars, typval_T *rettv)
     tabpage_T	*tp;
     win_T	*wp;
 
+    if (in_vim9script()
+	    && (check_for_buffer_arg(argvars, 0) == FAIL
+		|| check_for_lnum_arg(argvars, 1) == FAIL
+		|| check_for_opt_lnum_arg(argvars, 2) == FAIL))
+	return;
+
     buf = tv_get_buf(&argvars[0], FALSE);
     if (buf == NULL)
     {
@@ -497,24 +514,25 @@ f_deletebufline(typval_T *argvars, typval_T *rettv)
     if (u_save(first - 1, last + 1) == FAIL)
     {
 	rettv->vval.v_number = 1;	// FAIL
-	return;
     }
+    else
+    {
+	for (lnum = first; lnum <= last; ++lnum)
+	    ml_delete_flags(first, ML_DEL_MESSAGE);
 
-    for (lnum = first; lnum <= last; ++lnum)
-	ml_delete_flags(first, ML_DEL_MESSAGE);
-
-    FOR_ALL_TAB_WINDOWS(tp, wp)
-	if (wp->w_buffer == buf)
-	{
-	    if (wp->w_cursor.lnum > last)
-		wp->w_cursor.lnum -= count;
-	    else if (wp->w_cursor.lnum> first)
-		wp->w_cursor.lnum = first;
-	    if (wp->w_cursor.lnum > wp->w_buffer->b_ml.ml_line_count)
-		wp->w_cursor.lnum = wp->w_buffer->b_ml.ml_line_count;
-	}
-    check_cursor_col();
-    deleted_lines_mark(first, count);
+	FOR_ALL_TAB_WINDOWS(tp, wp)
+	    if (wp->w_buffer == buf)
+	    {
+		if (wp->w_cursor.lnum > last)
+		    wp->w_cursor.lnum -= count;
+		else if (wp->w_cursor.lnum> first)
+		    wp->w_cursor.lnum = first;
+		if (wp->w_cursor.lnum > wp->w_buffer->b_ml.ml_line_count)
+		    wp->w_cursor.lnum = wp->w_buffer->b_ml.ml_line_count;
+	    }
+	check_cursor_col();
+	deleted_lines_mark(first, count);
+    }
 
     if (!is_curbuf)
     {
@@ -615,6 +633,11 @@ f_getbufinfo(typval_T *argvars, typval_T *rettv)
     int		sel_bufmodified = FALSE;
 
     if (rettv_list_alloc(rettv) != OK)
+	return;
+
+    if (in_vim9script()
+	    && argvars[0].v_type != VAR_UNKNOWN
+	    && check_for_buffer_or_dict_arg(argvars, 0) == FAIL)
 	return;
 
     // List of all the buffers or selected buffers
@@ -721,6 +744,12 @@ f_getbufline(typval_T *argvars, typval_T *rettv)
     linenr_T	end = 1;
     buf_T	*buf;
 
+    if (in_vim9script()
+	    && (check_for_buffer_arg(argvars, 0) == FAIL
+		|| check_for_lnum_arg(argvars, 1) == FAIL
+		|| check_for_opt_lnum_arg(argvars, 2) == FAIL))
+	return;
+
     buf = tv_get_buf_from_arg(&argvars[0]);
     if (buf != NULL)
     {
@@ -749,6 +778,11 @@ f_getline(typval_T *argvars, typval_T *rettv)
     linenr_T	lnum;
     linenr_T	end;
     int		retlist;
+
+    if (in_vim9script()
+	    && (check_for_lnum_arg(argvars, 0) == FAIL
+		|| check_for_opt_lnum_arg(argvars, 1) == FAIL))
+	return;
 
     lnum = tv_get_lnum(argvars);
     if (argvars[1].v_type == VAR_UNKNOWN)
@@ -807,6 +841,9 @@ f_setline(typval_T *argvars, typval_T *rettv)
 switch_buffer(bufref_T *save_curbuf, buf_T *buf)
 {
     block_autocmds();
+#ifdef FEAT_FOLDING
+    ++disable_fold_update;
+#endif
     set_bufref(save_curbuf, curbuf);
     --curbuf->b_nwindows;
     curbuf = buf;
@@ -821,6 +858,9 @@ switch_buffer(bufref_T *save_curbuf, buf_T *buf)
 restore_buffer(bufref_T *save_curbuf)
 {
     unblock_autocmds();
+#ifdef FEAT_FOLDING
+    --disable_fold_update;
+#endif
     // Check for valid buffer, just in case.
     if (bufref_valid(save_curbuf))
     {

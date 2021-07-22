@@ -74,9 +74,6 @@ toggle_Magic(int x)
 static char_u e_missingbracket[] = N_("E769: Missing ] after %s[");
 static char_u e_reverse_range[] = N_("E944: Reverse range in character class");
 static char_u e_large_class[] = N_("E945: Range too large in character class");
-static char_u e_unmatchedpp[] = N_("E53: Unmatched %s%%(");
-static char_u e_unmatchedp[] = N_("E54: Unmatched %s(");
-static char_u e_unmatchedpar[] = N_("E55: Unmatched %s)");
 #ifdef FEAT_SYN_HL
 static char_u e_z_not_allowed[] = N_("E66: \\z( not allowed here");
 static char_u e_z1_not_allowed[] = N_("E67: \\z1 - \\z9 not allowed here");
@@ -202,7 +199,7 @@ get_char_class(char_u **pp)
 
     if ((*pp)[1] == ':')
     {
-	for (i = 0; i < (int)(sizeof(class_names) / sizeof(*class_names)); ++i)
+	for (i = 0; i < (int)ARRAY_LENGTH(class_names); ++i)
 	    if (STRNCMP(*pp + 2, class_names[i], STRLEN(class_names[i])) == 0)
 	    {
 		*pp += STRLEN(class_names[i]) + 2;
@@ -294,6 +291,7 @@ init_class_tab(void)
 
 static char_u	*regparse;	// Input-scan pointer.
 static int	regnpar;	// () count.
+static int	wants_nfa;	// regex should use NFA engine
 #ifdef FEAT_SYN_HL
 static int	regnzpar;	// \z() count.
 static int	re_has_z;	// \z item detected
@@ -303,11 +301,7 @@ static unsigned	regflags;	// RF_ flags for prog
 static int	had_eol;	// TRUE when EOL found by vim_regcomp()
 #endif
 
-static int	reg_magic;	// magicness of the pattern:
-#define MAGIC_NONE	1	// "\V" very unmagic
-#define MAGIC_OFF	2	// "\M" or 'magic' off
-#define MAGIC_ON	3	// "\m" or 'magic'
-#define MAGIC_ALL	4	// "\v" very magic
+static magic_T	reg_magic;	// magicness of the pattern
 
 static int	reg_string;	// matching with a string instead of a buffer
 				// line
@@ -381,6 +375,9 @@ static int	cstrncmp(char_u *s1, char_u *s2, int *n);
 static char_u	*cstrchr(char_u *, int);
 static int	re_mult_next(char *what);
 static int	reg_iswordc(int);
+#ifdef FEAT_EVAL
+static void report_re_switch(char_u *pat);
+#endif
 
 static regengine_T bt_regengine;
 static regengine_T nfa_regengine;
@@ -544,7 +541,7 @@ skip_regexp(
     int		delim,
     int		magic)
 {
-    return skip_regexp_ex(startp, delim, magic, NULL, NULL);
+    return skip_regexp_ex(startp, delim, magic, NULL, NULL, NULL);
 }
 
 /*
@@ -573,6 +570,7 @@ skip_regexp_err(
  * expression and change "\?" to "?".  If "*newp" is not NULL the expression
  * is changed in-place.
  * If a "\?" is changed to "?" then "dropped" is incremented, unless NULL.
+ * If "magic_val" is not NULL, returns the effective magicness of the pattern
  */
     char_u *
 skip_regexp_ex(
@@ -580,9 +578,10 @@ skip_regexp_ex(
     int		dirc,
     int		magic,
     char_u	**newp,
-    int		*dropped)
+    int		*dropped,
+    magic_T	*magic_val)
 {
-    int		mymagic;
+    magic_T	mymagic;
     char_u	*p = startp;
 
     if (magic)
@@ -628,6 +627,8 @@ skip_regexp_ex(
 		mymagic = MAGIC_NONE;
 	}
     }
+    if (magic_val != NULL)
+	*magic_val = mymagic;
     return p;
 }
 
@@ -1275,6 +1276,7 @@ reg_match_visual(void)
     colnr_T	start, end;
     colnr_T	start2, end2;
     colnr_T	cols;
+    colnr_T	curswant;
 
     // Check if the buffer is the current buffer.
     if (rex.reg_buf != curbuf || VIsual.lnum == 0)
@@ -1293,6 +1295,7 @@ reg_match_visual(void)
 	    bot = VIsual;
 	}
 	mode = VIsual_mode;
+	curswant = wp->w_curswant;
     }
     else
     {
@@ -1307,6 +1310,7 @@ reg_match_visual(void)
 	    bot = curbuf->b_visual.vi_start;
 	}
 	mode = curbuf->b_visual.vi_mode;
+	curswant = curbuf->b_visual.vi_curswant;
     }
     lnum = rex.lnum + rex.reg_firstlnum;
     if (lnum < top.lnum || lnum > bot.lnum)
@@ -1327,7 +1331,7 @@ reg_match_visual(void)
 	    start = start2;
 	if (end2 > end)
 	    end = end2;
-	if (top.col == MAXCOL || bot.col == MAXCOL)
+	if (top.col == MAXCOL || bot.col == MAXCOL || curswant == MAXCOL)
 	    end = MAXCOL;
 	cols = win_linetabsize(wp, rex.line, (colnr_T)(rex.input - rex.line));
 	if (cols < start || cols > end - (*p_sel == 'e'))
@@ -1352,7 +1356,7 @@ prog_magic_wrong(void)
 
     if (UCHARAT(((bt_regprog_T *)prog)->program) != REGMAGIC)
     {
-	emsg(_(e_re_corr));
+	emsg(_(e_corrupted_regexp_program));
 	return TRUE;
     }
     return FALSE;
@@ -1975,7 +1979,7 @@ vim_regsub_both(
     // Be paranoid...
     if ((source == NULL && expr == NULL) || dest == NULL)
     {
-	emsg(_(e_null));
+	emsg(_(e_null_argument));
 	return 0;
     }
     if (prog_magic_wrong())
@@ -2065,6 +2069,9 @@ vim_regsub_both(
 		}
 		clear_tv(&rettv);
 	    }
+	    else if (substitute_instr != NULL)
+		// Execute instructions from ISN_SUBSTITUTE.
+		eval_result = exe_substitute_instr();
 	    else
 		eval_result = eval_to_string(source + 2, TRUE);
 
@@ -2279,7 +2286,7 @@ vim_regsub_both(
 		    else if (*s == NUL) // we hit NUL.
 		    {
 			if (copy)
-			    iemsg(_(e_re_damg));
+			    iemsg(_(e_damaged_match_string));
 			goto exit;
 		    }
 		    else
@@ -2662,7 +2669,7 @@ vim_regcomp(char_u *expr_arg, int re_flags)
     if (prog == NULL)
     {
 #ifdef BT_REGEXP_DEBUG_LOG
-	if (regexp_engine != BACKTRACKING_ENGINE)   // debugging log for NFA
+	if (regexp_engine == BACKTRACKING_ENGINE)   // debugging log for BT engine
 	{
 	    FILE *f;
 	    f = fopen(BT_REGEXP_DEBUG_LOG_NAME, "a");
@@ -2686,6 +2693,9 @@ vim_regcomp(char_u *expr_arg, int re_flags)
 					  && called_emsg == called_emsg_before)
 	{
 	    regexp_engine = BACKTRACKING_ENGINE;
+#ifdef FEAT_EVAL
+	    report_re_switch(expr);
+#endif
 	    prog = bt_regengine.regcomp(expr, re_flags);
 	}
     }
